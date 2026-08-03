@@ -231,6 +231,8 @@ def send_otp(payload: SendOtpPayload):
 
     if not DEVELOPMENT:
         send_otp_email(email, otp_code)
+    else:
+        print(f"[DEV] OTP for {email}: {otp_code}")
 
     return {"sent": True}
 
