@@ -283,7 +283,7 @@ def verify_otp(payload: VerifyOtpPayload, response: Response):
         if existing:
             raise HTTPException(409, "Email or username is already registered.")
 
-        new_user = User(email=email, username=username, password=None, email_verified=True)
+        new_user = User(email=email, username=username, password=None, email_verified=True, is_subscribed=True)
         try:
             db.session.add(new_user)
             db.session.commit()
@@ -371,6 +371,7 @@ def google_auth(payload: GoogleAuthPayload, response: Response):
             google_id=google_sub,
             display_name=name[:50] if name else None,
             email_verified=True,
+            is_subscribed=True,
         )
         db.session.add(user)
         db.session.commit()
@@ -468,6 +469,7 @@ def apple_auth(payload: AppleAuthPayload, response: Response):
             apple_id=apple_sub,
             display_name=name[:50] if name else None,
             email_verified=True,
+            is_subscribed=True,
         )
         db.session.add(user)
         db.session.commit()
