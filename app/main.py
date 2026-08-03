@@ -22,7 +22,7 @@ Base.metadata.create_all(engine)
 
 if not DEVELOPMENT:
     sentry_sdk.init(
-        dsn="https://d794ed7cb82ca2c3e95cf1ceb96c3bd9@o313912.ingest.us.sentry.io/4510944527515648",
+        dsn="https://398b7beeb8d327a35633c33e33945cc8@o4511849372188672.ingest.us.sentry.io/4511849426124800",
         # Add data like request headers and IP for users,
         # see https://docs.sentry.io/platforms/python/data-management/data-collected/ for more info
         send_default_pii=True,

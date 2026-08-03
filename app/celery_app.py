@@ -4,7 +4,7 @@ import ssl
 import sentry_sdk
 from celery import Celery
 
-SENTRY_DSN = "https://d794ed7cb82ca2c3e95cf1ceb96c3bd9@o313912.ingest.us.sentry.io/4510944527515648"
+SENTRY_DSN = "https://398b7beeb8d327a35633c33e33945cc8@o4511849372188672.ingest.us.sentry.io/4511849426124800"
 DEVELOPMENT = os.getenv("DEVELOPMENT", 0)
 
 if not DEVELOPMENT:
