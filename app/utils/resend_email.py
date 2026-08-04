@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 resend.api_key = RESEND_API_KEY
 
-FROM_EMAIL = "Packstack <jerad@packstack.io>"
+FROM_EMAIL = "Packstack <onboarding@resend.dev>"
 
 EMAIL_WRAPPER = """
 <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 520px; margin: 0 auto; padding: 40px 24px;">
