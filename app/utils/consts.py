@@ -1,6 +1,6 @@
 import os
 
-DEVELOPMENT = os.getenv('DEVELOPMENT', 0)
+DEVELOPMENT = os.getenv('DEVELOPMENT', '0') == '1'
 
 POSTGRES_USER = os.getenv('POSTGRES_USER')
 POSTGRES_PASSWORD = os.getenv('POSTGRES_PASSWORD')
