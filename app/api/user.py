@@ -3,7 +3,6 @@ import json
 import logging
 import random
 import time
-import uuid
 
 import jwt as pyjwt
 import requests as http_requests
@@ -25,6 +24,7 @@ from models.base import (
 )
 from utils.auth import authenticate, generate_jwt, set_auth_cookie
 from cryptography.hazmat.primitives import serialization
+from utils.username import generate_username
 from utils.consts import (
     DEVELOPMENT, GOOGLE_CLIENT_IDS, APPLE_CLIENT_IDS, REVIEW_EMAIL, REVIEW_OTP,
     APPLE_KEY_ID, APPLE_TEAM_ID, APPLE_PRIVATE_KEY, GOOGLE_CLIENT_SECRET,
@@ -189,17 +189,19 @@ def send_otp(payload: SendOtpPayload):
         return {"sent": True}
 
     if payload.is_registration:
-        if not payload.username:
-            raise HTTPException(400, "Username is required for registration.")
+        # Optional now: the clients no longer collect a username and the server
+        # generates one at verify time. Still honoured when sent, because
+        # released app builds keep sending it.
+        username = (payload.username or "").strip()
 
-        username = payload.username.strip()
-
-        if len(username) > 15:
+        if username and len(username) > 15:
             raise HTTPException(400, "Username cannot exceed 15 characters.")
 
-        existing = db.session.query(User).filter(
-            (User.email == email) | (func.lower(User.username) == username.lower())
-        ).first()
+        clash = (User.email == email)
+        if username:
+            clash = clash | (func.lower(User.username) == username.lower())
+
+        existing = db.session.query(User).filter(clash).first()
 
         if existing:
             raise HTTPException(409, "Email or username is already registered.")
@@ -237,11 +239,125 @@ def send_otp(payload: SendOtpPayload):
     return {"sent": True}
 
 
+class OnboardingProfilePayload(BaseModel):
+    # Optional so a malformed draft can never fail the registration itself;
+    # this model is validated at the request boundary, outside the helper's
+    # never-raises contract. apply_onboarding skips a nameless profile.
+    name: Optional[str] = None
+    weight: Optional[float] = None
+    height: Optional[float] = None
+    year_of_birth: Optional[int] = None
+    sex: Optional[str] = None
+    body_type: Optional[str] = None
+
+
+class OnboardingUnitsPayload(BaseModel):
+    unit_weight: Optional[str] = None
+    unit_distance: Optional[str] = None
+    unit_temperature: Optional[str] = None
+
+
+class OnboardingPayload(BaseModel):
+    """Answers collected before the account existed, sent by mobile onboarding.
+
+    Optional everywhere — web registers first and configures afterwards, so it
+    sends nothing and behaves exactly as before.
+    """
+    profile: Optional[OnboardingProfilePayload] = None
+    units: Optional[OnboardingUnitsPayload] = None
+
+
+def _username_taken(candidate: str) -> bool:
+    """Availability check passed to generate_username.
+
+    Advisory only. Two registrations can draw the same name between this check
+    and the insert; the unique index is what actually guarantees it, and the
+    caller reports that as a normal registration failure.
+    """
+    return db.session.query(User.id).filter(
+        func.lower(User.username) == candidate.lower()).first() is not None
+
+
+def apply_onboarding(user: User, onboarding: Optional[OnboardingPayload]):
+    """Apply pre-registration onboarding answers to a NEWLY CREATED user.
+
+    Callers must only invoke this on the branch that just created the account.
+    That restriction is the whole point: the server knows whether it created
+    the user, so one person's onboarding answers can never be written into
+    someone else's existing account — a guarantee no client-side check can make.
+
+    Never raises. A malformed profile must not cost someone their registration;
+    they can fill it in from the app afterwards.
+
+    Returns a plain dict for the created profile, or None. Deliberately not the
+    ORM object: the session commits again later in these handlers (the OTP
+    cleanup, the social refresh-token exchange), and with expire_on_commit the
+    instance is expired by then — FastAPI would encode it as an empty object.
+    """
+    if not onboarding:
+        return None
+
+    # Units first and on their own, so a rejected profile can't take the unit
+    # preferences down with it — there is no recovery screen for those.
+    if onboarding.units:
+        try:
+            units = onboarding.units
+            if units.unit_weight:
+                user.unit_weight = units.unit_weight
+            if units.unit_distance:
+                user.unit_distance = units.unit_distance
+            if units.unit_temperature:
+                user.unit_temperature = units.unit_temperature
+            db.session.commit()
+        except Exception:
+            logger.exception(
+                "Failed to apply onboarding units for user %s", user.id)
+            db.session.rollback()
+
+    name = (onboarding.profile.name or "").strip() if onboarding.profile else ""
+    if not name:
+        return None
+
+    payload = onboarding.profile
+    try:
+        profile = HikerProfile(
+            user_id=user.id,
+            name=name[:255],
+            weight=payload.weight,
+            height=payload.height,
+            year_of_birth=payload.year_of_birth,
+            sex=(payload.sex or None) and payload.sex[:10],
+            body_type=(payload.body_type or None) and payload.body_type[:20],
+            is_default=True,
+        )
+        db.session.add(profile)
+        db.session.commit()
+
+        return {
+            "id": profile.id,
+            "user_id": profile.user_id,
+            "name": profile.name,
+            "weight": float(profile.weight) if profile.weight is not None else None,
+            "height": float(profile.height) if profile.height is not None else None,
+            "year_of_birth": profile.year_of_birth,
+            "sex": profile.sex,
+            "body_type": profile.body_type,
+            "is_default": profile.is_default,
+            "created_at": profile.created_at,
+        }
+    except Exception:
+        logger.exception(
+            "Failed to apply onboarding profile for user %s", user.id)
+        db.session.rollback()
+        return None
+
+
 class VerifyOtpPayload(BaseModel):
     email: str
     otp: str
     is_registration: bool
     username: Optional[str] = None
+    onboarding: Optional[OnboardingPayload] = None
 
 
 @route.post("/verify-otp")
@@ -272,18 +388,27 @@ def verify_otp(payload: VerifyOtpPayload, response: Response):
     if not record or record.otp_code != otp:
         raise HTTPException(401, "Invalid or expired code.")
 
+    created_profile = None
+
     if payload.is_registration:
         username = (payload.username or record.username or "").strip()
-        if not username:
-            raise HTTPException(400, "Username is required for registration.")
 
-        existing = db.session.query(User).filter(
-            (User.email == email) | (func.lower(User.username) == username.lower())
-        ).first()
+        # Reject a taken email regardless; only check the username when the
+        # client actually chose one. A generated name is checked as it is
+        # drawn, so re-checking it here would be redundant.
+        clash = (User.email == email)
+        if username:
+            clash = clash | (func.lower(User.username) == username.lower())
+
+        existing = db.session.query(User).filter(clash).first()
         if existing:
             raise HTTPException(409, "Email or username is already registered.")
 
+        if not username:
+            username = generate_username(_username_taken)
+
         new_user = User(email=email, username=username, password=None, email_verified=True, is_subscribed=True)
+        
         try:
             db.session.add(new_user)
             db.session.commit()
@@ -291,6 +416,10 @@ def verify_otp(payload: VerifyOtpPayload, response: Response):
         except Exception:
             logger.exception("Failed to create user")
             raise HTTPException(400, "An error occurred.")
+
+        # Only on this branch — the account was just created here, so these
+        # answers cannot belong to anyone else.
+        created_profile = apply_onboarding(new_user, payload.onboarding)
 
         if not DEVELOPMENT:
             create_contact(email)
@@ -312,12 +441,16 @@ def verify_otp(payload: VerifyOtpPayload, response: Response):
     return {
         "user": user.to_dict(),
         "token": jwt_token,
+        # Returned so a client that sent onboarding answers can seed its
+        # cache instead of refetching what it just created.
+        "hiker_profile": created_profile,
     }
 
 
 class GoogleAuthPayload(BaseModel):
     credential: str
     server_auth_code: Optional[str] = None
+    onboarding: Optional[OnboardingPayload] = None
 
 
 @route.post("/google-auth")
@@ -341,6 +474,7 @@ def google_auth(payload: GoogleAuthPayload, response: Response):
     if not idinfo:
         raise HTTPException(status_code=401, detail="Invalid Google token.")
 
+    created_profile = None
     google_sub = idinfo["sub"]
     email = idinfo["email"]
     name = idinfo.get("name", "")
@@ -357,12 +491,11 @@ def google_auth(payload: GoogleAuthPayload, response: Response):
             db.session.commit()
 
     if not user:
-        username = email.split("@")[0][:15]
-        existing = db.session.query(User).filter(
-            func.lower(User.username) == username.lower()
-        ).first()
-        if existing:
-            username = (username[:7] + uuid.uuid4().hex[:8])[:15]
+        # Not derived from the email any more. Usernames are returned by the
+        # public shared-trip endpoint, so the old scheme published a
+        # recognisable piece of every social signup's address to anyone with
+        # a trip link.
+        username = generate_username(_username_taken)
 
         user = User(
             email=email,
@@ -376,6 +509,12 @@ def google_auth(payload: GoogleAuthPayload, response: Response):
         db.session.add(user)
         db.session.commit()
         db.session.refresh(user)
+
+        # Only on this branch. Google and Apple auth are the same endpoint for
+        # sign-in and sign-up, so the server discovering that it just created
+        # the account is the only reliable signal that these answers belong to
+        # it — a client can't tell the two apart.
+        created_profile = apply_onboarding(user, payload.onboarding)
 
         if not DEVELOPMENT:
             first_name, _, last_name = name.partition(" ") if name else ("", "", "")
@@ -394,7 +533,10 @@ def google_auth(payload: GoogleAuthPayload, response: Response):
 
     return {
         "user": user.to_dict(),
-        "token": jwt_token
+        "token": jwt_token,
+        # Returned so a client that sent onboarding answers can seed its
+        # cache instead of refetching what it just created.
+        "hiker_profile": created_profile,
     }
 
 
@@ -402,6 +544,7 @@ class AppleAuthPayload(BaseModel):
     identity_token: str
     full_name: Optional[str] = None
     authorization_code: Optional[str] = None
+    onboarding: Optional[OnboardingPayload] = None
 
 
 @route.post("/apple-auth")
@@ -443,6 +586,7 @@ def apple_auth(payload: AppleAuthPayload, response: Response):
     if not email:
         raise HTTPException(status_code=401, detail="Apple token missing email.")
 
+    created_profile = None
     user = db.session.query(User).filter_by(apple_id=apple_sub).first()
 
     if not user:
@@ -455,12 +599,11 @@ def apple_auth(payload: AppleAuthPayload, response: Response):
             db.session.commit()
 
     if not user:
-        username = email.split("@")[0][:15]
-        existing = db.session.query(User).filter(
-            func.lower(User.username) == username.lower()
-        ).first()
-        if existing:
-            username = (username[:7] + uuid.uuid4().hex[:8])[:15]
+        # Not derived from the email any more. Usernames are returned by the
+        # public shared-trip endpoint, so the old scheme published a
+        # recognisable piece of every social signup's address to anyone with
+        # a trip link.
+        username = generate_username(_username_taken)
 
         user = User(
             email=email,
@@ -474,6 +617,12 @@ def apple_auth(payload: AppleAuthPayload, response: Response):
         db.session.add(user)
         db.session.commit()
         db.session.refresh(user)
+
+        # Only on this branch. Google and Apple auth are the same endpoint for
+        # sign-in and sign-up, so the server discovering that it just created
+        # the account is the only reliable signal that these answers belong to
+        # it — a client can't tell the two apart.
+        created_profile = apply_onboarding(user, payload.onboarding)
 
         if not DEVELOPMENT:
             first_name, _, last_name = name.partition(" ") if name else ("", "", "")
@@ -493,6 +642,9 @@ def apple_auth(payload: AppleAuthPayload, response: Response):
     return {
         "user": user.to_dict(),
         "token": jwt_token,
+        # Returned so a client that sent onboarding answers can seed its
+        # cache instead of refetching what it just created.
+        "hiker_profile": created_profile,
     }
 
 
